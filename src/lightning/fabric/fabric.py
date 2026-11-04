@@ -59,7 +59,11 @@ from lightning.fabric.utilities.data import (
     has_iterable_dataset,
 )
 from lightning.fabric.utilities.device_dtype_mixin import _update_properties
-from lightning.fabric.utilities.distributed import DistributedSamplerWrapper, _InfiniteBarrier
+from lightning.fabric.utilities.distributed import (
+    DistributedSamplerWrapper,
+    _distributed_is_initialized,
+    _InfiniteBarrier,
+)
 from lightning.fabric.utilities.init import _has_meta_device_parameters_or_buffers
 from lightning.fabric.utilities.rank_zero import rank_zero_deprecation, rank_zero_warn
 from lightning.fabric.utilities.registry import _load_external_callbacks
@@ -627,14 +631,23 @@ class Fabric:
             print(*args, **kwargs)
 
     def barrier(self, name: Optional[str] = None) -> None:
-        """Wait for all processes to enter this call.
+        """Wait for all processes to enter this call with the same barrier name.
 
         Use this to synchronize all parallel processes, but only if necessary, otherwise the overhead of synchronization
-        will cause your program to slow down. This method needs to be called on all processes. Failing to do so will
-        cause your program to stall forever.
+        will cause your program to slow down. This method needs to be called on all processes. When distributed is
+        initialized with more than one process, the barrier names are compared across processes, and a mismatch raises
+        a :class:`RuntimeError`. Passing ``None`` is also checked against the names passed by other processes.
 
         """
         self._validate_launched()
+        if _distributed_is_initialized():
+            world_size = torch.distributed.get_world_size()
+            if world_size > 1:
+                names: list[Optional[str]] = [None] * world_size
+                torch.distributed.all_gather_object(names, name)
+                if any(barrier_name != names[0] for barrier_name in names[1:]):
+                    barriers = ", ".join(f"rank {rank}: {barrier_name!r}" for rank, barrier_name in enumerate(names))
+                    raise RuntimeError(f"Ranks reached different barriers: {barriers}")
         self._strategy.barrier(name=name)
 
     def broadcast(self, obj: TBroadcast, src: int = 0) -> TBroadcast:
@@ -864,7 +877,7 @@ class Fabric:
                 if not callable(v):
                     raise TypeError(f"Expected `fabric.save(filter=...)` for key {k!r} to be a callable, given {v!r}")
         self._strategy.save_checkpoint(path=path, state=_unwrap_objects(state), filter=filter)
-        self.barrier()
+        self.barrier("save")
 
     def load(
         self,
@@ -912,7 +925,7 @@ class Fabric:
             strict=strict,
             weights_only=weights_only,
         )
-        self.barrier()
+        self.barrier("load")
         if state is not None:
             # We need to unwrap objects (see above) but this creates a new dictionary. In-place updates
             # (for user metadata) wouldn't show up in the original dict, so we need to copy the data back.

@@ -1161,6 +1161,45 @@ def test_barrier():
     fabric._strategy.barrier.assert_called_once_with(name="test")
 
 
+def test_barrier_names_match(monkeypatch):
+    """Test that `Fabric.barrier()` proceeds when all processes use the same name."""
+    monkeypatch.setattr(torch.distributed, "is_initialized", Mock(return_value=True))
+    monkeypatch.setattr(torch.distributed, "get_world_size", Mock(return_value=2))
+
+    def all_gather_object(object_list, obj):
+        object_list[:] = [obj, obj]
+
+    all_gather_mock = Mock(side_effect=all_gather_object)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_mock)
+
+    fabric = Fabric()
+    fabric._strategy = Mock()
+    fabric._launched = True
+    fabric.barrier("test")
+
+    all_gather_mock.assert_called_once()
+    fabric._strategy.barrier.assert_called_once_with(name="test")
+
+
+def test_barrier_names_dont_match(monkeypatch):
+    """Test that `Fabric.barrier()` compares unnamed barriers against named barriers."""
+    monkeypatch.setattr(torch.distributed, "is_initialized", Mock(return_value=True))
+    monkeypatch.setattr(torch.distributed, "get_world_size", Mock(return_value=2))
+
+    def all_gather_object(object_list, obj):
+        object_list[:] = [obj, "other"]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", Mock(side_effect=all_gather_object))
+
+    fabric = Fabric()
+    fabric._strategy = Mock()
+    fabric._launched = True
+    with pytest.raises(RuntimeError, match=r"rank 0: None, rank 1: 'other'"):
+        fabric.barrier()
+
+    fabric._strategy.barrier.assert_not_called()
+
+
 def test_broadcast():
     """Test that `Fabric.broadcast()` calls into the strategy."""
     fabric = Fabric()
